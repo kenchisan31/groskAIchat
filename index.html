@@ -49,6 +49,19 @@
   #send{background:linear-gradient(135deg,var(--green),var(--green-d));color:#fff;border:0;border-radius:10px;padding:0 18px;height:44px;cursor:pointer;font-weight:600;box-shadow:0 0 0 1px rgba(110,231,193,.25) inset}
   #send:hover{filter:brightness(1.1)}
   #send.stop{background:#b42318}
+  .app{position:relative}
+  .app.drag::after{content:"Drop images to attach";position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(3,22,18,.88);border:2px dashed var(--mint);color:var(--mint);font-size:20px;font-weight:700;z-index:5}
+  #previews{display:none;gap:8px;padding:10px 16px 0;background:var(--panel);flex-wrap:wrap}
+  #previews.on{display:flex}
+  .pv{position:relative;width:64px;height:64px}
+  .pv img{width:100%;height:100%;object-fit:cover;border-radius:10px;border:1px solid var(--line)}
+  .pv button{position:absolute;top:-6px;right:-6px;width:22px;height:22px;border-radius:50%;border:0;background:#b42318;color:#fff;cursor:pointer;line-height:1;font-size:14px;padding:0}
+  .thumbs{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px}
+  .thumbs img{max-width:200px;max-height:200px;border-radius:10px;display:block;object-fit:cover}
+  .note{font-size:13px;opacity:.85;margin-bottom:4px}
+  #attach{flex:none;width:44px;height:44px;border-radius:10px;border:1px solid var(--line);background:none;color:var(--mint);cursor:pointer;display:flex;align-items:center;justify-content:center}
+  #attach:hover{background:var(--panel2);border-color:var(--green)}
+  #attach svg{width:22px;height:22px}
 </style>
 </head>
 <body>
@@ -59,7 +72,10 @@
     <button class="ghost" id="clearBtn" type="button">New chat</button>
   </header>
   <div id="log" aria-live="polite"></div>
+  <div id="previews"></div>
   <form id="form">
+    <button id="attach" type="button" aria-label="Attach image" title="Attach image"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="9" cy="9" r="1.8"/><path d="M21 15l-5-5L5 21"/></svg></button>
+    <input id="file" type="file" accept="image/*" multiple hidden>
     <textarea id="input" rows="1" placeholder="Type a message… (Enter to send, Shift+Enter for a new line)"></textarea>
     <button id="send" type="submit">Send</button>
   </form>
@@ -67,12 +83,13 @@
 
 <script>
 const TZ = 'America/Los_Angeles'; // California time
+const MAX_IMG = 4, MAX_SIDE = 1280, BUDGET = 3200000; // images per message, px, total base64 chars per request
 const $ = id => document.getElementById(id);
-const log = $('log'), input = $('input'), sendBtn = $('send');
-let history = [];
+const log = $('log'), input = $('input'), sendBtn = $('send'), app = document.querySelector('.app');
+let history = [], pending = [], controller = null;
 try { history = JSON.parse(localStorage.getItem('chat_hist_en') || '[]'); } catch {}
-let controller = null;
-const saveHist = () => { try { localStorage.setItem('chat_hist_en', JSON.stringify(history)); } catch {} };
+// Images are kept in memory only (too big for localStorage); we save just a count.
+const saveHist = () => { try { localStorage.setItem('chat_hist_en', JSON.stringify(history.map(m => ({ role:m.role, content:m.content, ts:m.ts, n:m.images ? m.images.length : (m.n || 0) })))); } catch {} };
 
 const fmt = ts => new Date(ts).toLocaleTimeString('en-US', { timeZone:TZ, hour:'numeric', minute:'2-digit', timeZoneName:'short' });
 function tickClock(){
@@ -87,12 +104,20 @@ function render(text){
     return esc(p).replace(/`([^`\n]+)`/g,'<code>$1</code>').replace(/\*\*([^*\n]+)\*\*/g,'<b>$1</b>');
   }).join('');
 }
-function addMsg(role, text, ts){
-  const row = document.createElement('div');
-  row.className = 'row ' + role;
-  const el = document.createElement('div');
-  el.className = 'msg';
-  if (role === 'assistant') el.innerHTML = render(text); else el.textContent = text;
+function addMsg(role, text, ts, images, n){
+  if (log.querySelector('.empty')) log.innerHTML = '';
+  const row = document.createElement('div'); row.className = 'row ' + role;
+  const el = document.createElement('div'); el.className = 'msg';
+  if (images && images.length) {
+    const g = document.createElement('div'); g.className = 'thumbs';
+    images.forEach(u => { const i = document.createElement('img'); i.src = u; i.alt = 'Attached image'; g.appendChild(i); });
+    el.appendChild(g);
+  } else if (n) {
+    const g = document.createElement('div'); g.className = 'note';
+    g.textContent = '📷 ' + n + ' image' + (n > 1 ? 's' : '') + ' (not kept after reload)';
+    el.appendChild(g);
+  }
+  if (role === 'assistant') el.innerHTML += render(text); else if (text) el.appendChild(document.createTextNode(text));
   row.appendChild(el);
   if (ts) { const t = document.createElement('div'); t.className = 'time'; t.textContent = fmt(ts); row.appendChild(t); }
   log.appendChild(row);
@@ -101,8 +126,8 @@ function addMsg(role, text, ts){
 }
 function redraw(){
   log.innerHTML = '';
-  if (!history.length) { log.innerHTML = '<div class="empty"><div class="logo"><svg viewBox="0 0 40 40" aria-hidden="true"><rect x="1" y="1" width="38" height="38" rx="12" fill="#07382d" stroke="#14a67d" stroke-width="1.5"/><polygon points="20,8 30,14 30,26 20,32 10,26 10,14" fill="none" stroke="#6ee7c1" stroke-width="2" stroke-linejoin="round"/><circle cx="20" cy="20" r="3.6" fill="#6ee7c1"/></svg></div><b>Ask GroskAI anything</b>Type a message below to start chatting.</div>'; return; }
-  history.forEach(m => addMsg(m.role, m.content, m.ts));
+  if (!history.length) { log.innerHTML = '<div class="empty"><div class="logo"><svg viewBox="0 0 40 40" aria-hidden="true"><rect x="1" y="1" width="38" height="38" rx="12" fill="#07382d" stroke="#14a67d" stroke-width="1.5"/><polygon points="20,8 30,14 30,26 20,32 10,26 10,14" fill="none" stroke="#6ee7c1" stroke-width="2" stroke-linejoin="round"/><circle cx="20" cy="20" r="3.6" fill="#6ee7c1"/></svg></div><b>Ask GroskAI anything</b>Type a message or attach an image to start chatting.</div>'; return; }
+  history.forEach(m => addMsg(m.role, m.content, m.ts, m.images, m.n));
 }
 function setBusy(b){
   sendBtn.textContent = b ? 'Stop' : 'Send';
@@ -110,10 +135,68 @@ function setBusy(b){
   sendBtn.type = b ? 'button' : 'submit';
 }
 
-async function send(text){
-  if (log.querySelector('.empty')) log.innerHTML = '';
-  history.push({ role:'user', content:text, ts:Date.now() });
-  addMsg('user', text, Date.now());
+// ---- Images: pick, paste, drag & drop; resized + compressed in the browser ----
+function compress(file){
+  return new Promise((ok, no) => {
+    const url = URL.createObjectURL(file), img = new Image();
+    img.onload = () => {
+      const r = Math.min(1, MAX_SIDE / Math.max(img.width, img.height));
+      const c = document.createElement('canvas'); c.width = Math.round(img.width * r); c.height = Math.round(img.height * r);
+      const x = c.getContext('2d'); x.fillStyle = '#fff'; x.fillRect(0, 0, c.width, c.height); x.drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(url); ok(c.toDataURL('image/jpeg', 0.82));
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); no(); };
+    img.src = url;
+  });
+}
+function renderPending(){
+  const box = $('previews'); box.innerHTML = ''; box.classList.toggle('on', pending.length > 0);
+  pending.forEach((u, i) => {
+    const d = document.createElement('div'); d.className = 'pv';
+    const im = document.createElement('img'); im.src = u; im.alt = 'Preview';
+    const b = document.createElement('button'); b.type = 'button'; b.textContent = '×'; b.setAttribute('aria-label', 'Remove image');
+    b.onclick = () => { pending.splice(i, 1); renderPending(); };
+    d.append(im, b); box.appendChild(d);
+  });
+}
+async function addFiles(files){
+  const imgs = [...files].filter(f => f.type.startsWith('image/'));
+  for (const f of imgs) {
+    if (pending.length >= MAX_IMG) { addMsg('error', 'You can attach up to ' + MAX_IMG + ' images per message.'); break; }
+    if (f.size > 25 * 1024 * 1024) { addMsg('error', 'That image is too large (max 25 MB).'); continue; }
+    try { pending.push(await compress(f)); } catch { addMsg('error', "Couldn't read that image. Please try a JPG or PNG."); }
+  }
+  renderPending();
+}
+$('attach').onclick = () => $('file').click();
+$('file').onchange = e => { addFiles(e.target.files); e.target.value = ''; };
+input.addEventListener('paste', e => {
+  const fs = [...(e.clipboardData?.files || [])].filter(f => f.type.startsWith('image/'));
+  if (fs.length) { e.preventDefault(); addFiles(fs); }
+});
+document.addEventListener('dragover', e => { if (e.dataTransfer?.types?.includes('Files')) { e.preventDefault(); app.classList.add('drag'); } });
+document.addEventListener('dragleave', e => { if (!e.relatedTarget) app.classList.remove('drag'); });
+document.addEventListener('drop', e => { e.preventDefault(); app.classList.remove('drag'); if (e.dataTransfer?.files?.length) addFiles(e.dataTransfer.files); });
+
+// Newest images first, within a size budget (Vercel limits request bodies to ~4.5 MB)
+function buildMessages(){
+  let used = 0; const out = new Array(history.length);
+  for (let i = history.length - 1; i >= 0; i--) {
+    const m = history[i], imgs = [];
+    for (const u of (m.images || [])) if (used + u.length <= BUDGET) { used += u.length; imgs.push(u); }
+    const total = m.images ? m.images.length : (m.n || 0);
+    let text = m.content || '';
+    if (m.role === 'user' && total > imgs.length) text += (text ? ' ' : '') + '[Earlier image(s) not included]';
+    if (imgs.length) out[i] = { role:m.role, content:[{ type:'text', text:text || 'Please describe this image.' }, ...imgs.map(u => ({ type:'image_url', image_url:{ url:u } }))] };
+    else out[i] = { role:m.role, content:text || '(image)' };
+  }
+  return out;
+}
+
+async function send(text, images){
+  const ts0 = Date.now();
+  history.push({ role:'user', content:text, images, ts:ts0 });
+  const userRow = addMsg('user', text, ts0, images);
   const bot = addMsg('assistant', '…');
   controller = new AbortController();
   setBusy(true);
@@ -122,11 +205,11 @@ async function send(text){
     const res = await fetch('/api/chat', {
       method:'POST',
       headers:{ 'Content-Type':'application/json' },
-      body: JSON.stringify({ messages: history.map(({ role, content }) => ({ role, content })) }),
+      body: JSON.stringify({ messages: buildMessages() }),
       signal: controller.signal
     });
     if (!res.ok) {
-      let msg = 'Something went wrong (error ' + res.status + '). Please try again.';
+      let msg = res.status === 413 ? 'Your images are too large. Try fewer or smaller images.' : 'Something went wrong (error ' + res.status + '). Please try again.';
       try { msg = (await res.json()).error || msg; } catch {}
       throw new Error(msg);
     }
@@ -154,7 +237,12 @@ async function send(text){
     else {
       bot.row.remove();
       addMsg('error', e instanceof TypeError ? "Can't reach the server. Check your internet connection and try again." : e.message);
-      if (!acc) { history.pop(); saveHist(); setBusy(false); controller = null; return; }
+      if (!acc) { // give the message back so the user can retry
+        history.pop(); userRow.row.remove();
+        if (!input.value) input.value = text;
+        if (!pending.length) { pending = images; renderPending(); }
+        saveHist(); setBusy(false); controller = null; return;
+      }
     }
   }
   if (acc) {
@@ -168,16 +256,17 @@ async function send(text){
 $('form').addEventListener('submit', e => {
   e.preventDefault();
   const text = input.value.trim();
-  if (!text || controller) return;
+  if ((!text && !pending.length) || controller) return;
+  const imgs = pending; pending = []; renderPending();
   input.value = ''; input.style.height = 'auto';
-  send(text);
+  send(text, imgs);
 });
 sendBtn.addEventListener('click', () => { if (controller) controller.abort(); });
 input.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); $('form').requestSubmit(); }
 });
 input.addEventListener('input', () => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 160) + 'px'; });
-$('clearBtn').onclick = () => { if (controller) controller.abort(); history = []; saveHist(); redraw(); };
+$('clearBtn').onclick = () => { if (controller) controller.abort(); history = []; pending = []; renderPending(); saveHist(); redraw(); };
 redraw();
 </script>
 </body>
