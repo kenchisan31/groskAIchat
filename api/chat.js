@@ -11,6 +11,10 @@ const WINDOW_MS = 60 * 60 * 1000;                                   // 1 hour
 const DAILY_LIMIT = parseInt(process.env.DAILY_LIMIT || '500', 10);  // total messages per California day
 const MAX_MESSAGES = 30;
 const MAX_CHARS = 8000;
+const MAX_IMAGES_PER_MSG = 4;
+const MAX_IMAGES_TOTAL = 8;
+const MAX_IMG_CHARS = 1800000; // ~1.3 MB per image after base64
+const IMG_RE = /^data:image\/(jpeg|png|webp|gif);base64,[A-Za-z0-9+/=]+$/;
 
 // ---- Time helpers (California time) ----
 const fmtTime = d => new Date(d).toLocaleTimeString('en-US', { timeZone: TZ, hour: 'numeric', minute: '2-digit', timeZoneName: 'short' });
@@ -55,10 +59,29 @@ module.exports = async (req, res) => {
   try { body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {}); }
   catch { return fail(res, 400, 'bad_request', 'Invalid request.'); }
 
-  const messages = (Array.isArray(body.messages) ? body.messages : [])
-    .filter(m => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
-    .slice(-MAX_MESSAGES)
-    .map(m => ({ role: m.role, content: m.content.slice(0, MAX_CHARS) }));
+  const clean = m => {
+    if (!m || (m.role !== 'user' && m.role !== 'assistant')) return null;
+    if (typeof m.content === 'string') return { role: m.role, content: m.content.slice(0, MAX_CHARS) };
+    if (m.role === 'user' && Array.isArray(m.content)) {
+      const parts = []; let imgs = 0;
+      for (const p of m.content) {
+        if (p && p.type === 'text' && typeof p.text === 'string') parts.push({ type: 'text', text: p.text.slice(0, MAX_CHARS) });
+        else if (p && p.type === 'image_url' && typeof p.image_url?.url === 'string') {
+          const u = p.image_url.url;
+          if (imgs < MAX_IMAGES_PER_MSG && u.length <= MAX_IMG_CHARS && IMG_RE.test(u)) { imgs++; parts.push({ type: 'image_url', image_url: { url: u } }); }
+        }
+      }
+      return parts.length ? { role: m.role, content: parts } : null;
+    }
+    return null;
+  };
+  const messages = (Array.isArray(body.messages) ? body.messages : []).slice(-MAX_MESSAGES).map(clean).filter(Boolean);
+  let imgTotal = 0; // keep only the newest images
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (!Array.isArray(messages[i].content)) continue;
+    messages[i].content = messages[i].content.filter(p => p.type !== 'image_url' || ++imgTotal <= MAX_IMAGES_TOTAL);
+    if (!messages[i].content.length) messages[i].content = '[image omitted]';
+  }
 
   if (!messages.length) return fail(res, 400, 'empty', 'Please type a message first.');
 
@@ -79,6 +102,7 @@ module.exports = async (req, res) => {
       console.error('Upstream error', upstream.status, await upstream.text().catch(() => ''));
       if (upstream.status === 429) return fail(res, 429, 'busy', 'The bot is very busy right now. Please try again in a few minutes. (If this keeps happening, the free daily quota may be used up. It resets at midnight California time.)');
       if (upstream.status === 401 || upstream.status === 403) return fail(res, 502, 'auth', "The bot's API key isn't working. Please let the site owner know.");
+      if (upstream.status === 400) return fail(res, 502, 'bad_input', "The AI couldn't process that message. If you attached images, try fewer or smaller ones.");
       if (upstream.status === 404) return fail(res, 502, 'model', "The AI model couldn't be found. Please let the site owner know.");
       return fail(res, 502, 'upstream', 'The AI service is having trouble right now. Please try again shortly.');
     }
